@@ -147,3 +147,4 @@ csvs/gen_csv.ipynb
 *.csv
 *.json
 .gitignore
+test.py
