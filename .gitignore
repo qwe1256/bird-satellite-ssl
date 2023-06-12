@@ -148,3 +148,4 @@ csvs/gen_csv.ipynb
 *.json
 .gitignore
 test.py
+.DS_Store
