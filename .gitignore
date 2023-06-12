@@ -146,3 +146,4 @@ csvs/gen_csv.ipynb
 *.tar
 *.csv
 *.json
+.gitignore
