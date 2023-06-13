@@ -2,17 +2,15 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import argparse
 import builtins
-import math
 import os
 import random
 import shutil
 import time
 import warnings
-import numpy as np
+import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -21,22 +19,19 @@ import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
-import torchvision.models as models
 
 from tensorboardX import SummaryWriter
 
-import moco.loader
-import moco.builder
+import torchvision.models as models 
 
-
-from data_loader.fmow_dataloader import CustomDatasetFromImages, CustomDatasetFromImagesTemporal
+from data_loader.dataloader import Bird_Satellite_Dataset
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('--data', metavar='DIR',
+parser.add_argument('--data_path', metavar='DIR', type=str,
                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
@@ -45,7 +40,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=200, type=int, metavar='N',
+parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -54,19 +49,21 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.03, type=float,
+parser.add_argument('--lr', '--learning-rate', default=30., type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--schedule', default=[120, 160], nargs='*', type=int,
-                    help='learning rate schedule (when to drop lr by 10x)')
+parser.add_argument('--schedule', default=[60, 80], nargs='*', type=int,
+                    help='learning rate schedule (when to drop lr by a ratio)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum of SGD solver')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
-                    metavar='W', help='weight decay (default: 1e-4)',
+                    help='momentum')
+parser.add_argument('--wd', '--weight-decay', default=0., type=float,
+                    metavar='W', help='weight decay (default: 0.)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
@@ -84,43 +81,21 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
-
-# moco specific configs:
-parser.add_argument('--moco-dim', default=128, type=int,
-                    help='feature dimension (default: 128)')
-parser.add_argument('--moco-k', default=65536, type=int,
-                    help='queue size; number of negative keys (default: 65536)')
-parser.add_argument('--moco-m', default=0.999, type=float,
-                    help='moco momentum of updating key encoder (default: 0.999)')
-parser.add_argument('--moco-t', default=0.07, type=float,
-                    help='softmax temperature (default: 0.07)')
-
-# options for moco v2
-parser.add_argument('--mlp', action='store_true',
-                    help='use mlp head')
-parser.add_argument('--aug-plus', action='store_true',
-                    help='use moco v2 data augmentation')
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
-parser.add_argument('--loss', type=str, default='cpc',
-                    choices=['cpc', 'ml_cpc'],
-                    help="cpc: original objective, \
-                          ml_cpc: multi-class, alpha weights extension")
 
-parser.add_argument('--ml-cpc-alpha', default=1.0, type=float,
-                    help='alpha hyperparameter for ml_cpc')
-parser.add_argument('--ml-cpc-alpha-low', default=1.0, type=float)
-parser.add_argument('--ml-cpc-alpha-geo', action='store_true',
-                    help='use geometric scheduling for alpha in ml_cpc')
+parser.add_argument('--pretrained', default='', type=str,
+                    help='path to moco pretrained checkpoint')
 
 parser.add_argument('--save-dir', default='', type=str,
                     help='save location')
-parser.add_argument('--ckpt_frequency', default=1, type=int,
-                    help='frequency of updating checkpoint')
 
+best_acc1 = 0
+
+data_path = '' # modify to reflect cifar10 and cifar100 save location
 
 train_csv = "../csvs/train_62classes.csv"
-temporal = True
+test_csv = "../csvs/test_62classes.csv"
 
 def main():
     args = parser.parse_args()
@@ -162,6 +137,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
+    global best_acc1
     args.gpu = gpu
 
     # suppress printing if not master
@@ -184,9 +160,44 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = moco.builder.MoCo(
-        models.__dict__[args.arch],
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
+    model = models.__dict__[args.arch]()
+
+    # freeze all layers but the last fc
+    for name, param in model.named_parameters():
+        if name not in ['fc.weight', 'fc.bias']:
+            param.requires_grad = False
+    # init the fc layer
+    # monkey patch fix for cifar100
+    if args.data == 'cifar100':
+        model.fc = nn.Linear(model.fc.weight.size(1), 100)
+    if args.data == 'fmow':
+        model.fc = nn.Linear(model.fc.weight.size(1), 62)  # 224*224
+    model.fc.weight.data.normal_(mean=0.0, std=0.01)
+    model.fc.bias.data.zero_()
+
+    # load from pre-trained, before DistributedDataParallel constructor
+    if args.pretrained:
+        if os.path.isfile(args.pretrained):
+            print("=> loading checkpoint '{}'".format(args.pretrained))
+            checkpoint = torch.load(args.pretrained, map_location="cpu")
+
+            # rename moco pre-trained keys
+            state_dict = checkpoint['state_dict']
+            for k in list(state_dict.keys()):
+                # retain only encoder_q up to before the embedding layer
+                if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.fc'):
+                    # remove prefix
+                    state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+                # delete renamed or unused k
+                del state_dict[k]
+
+            args.start_epoch = 0
+            msg = model.load_state_dict(state_dict, strict=False)
+            assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
+
+            print("=> loaded pre-trained model '{}'".format(args.pretrained))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.pretrained))
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -211,26 +222,25 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
-        # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
-        # AllGather implementation (batch shuffle, queue update, etc.) in
-        # this code only supports DistributedDataParallel.
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        # DataParallel will divide and allocate batch_size to all available GPUs
+        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
+            model.features = torch.nn.DataParallel(model.features)
+            model.cuda()
+        else:
+            model = torch.nn.DataParallel(model).cuda()
 
     if args.rank == 0:
         writer = SummaryWriter(logdir=args.save_dir)
     else:
         writer = None
     # define loss function (criterion) and optimizer
-    if args.loss == 'cpc':
-        criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    elif args.loss == 'ml_cpc':
-        criterion = nn.KLDivLoss(reduction='batchmean').cuda(args.gpu)
-    else:
-        raise NotImplementedError(args.loss + ' not implemented yet.')
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    # optimize only the linear classifier
+    parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
+    assert len(parameters) == 2  # fc.weight, fc.bias
+    optimizer = torch.optim.SGD(parameters, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -245,6 +255,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
             args.start_epoch = checkpoint['epoch']
+            best_acc1 = checkpoint['best_acc1']
+            if args.gpu is not None:
+                # best_acc1 may be from a checkpoint from a different GPU
+                best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -254,51 +268,52 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
+    # Data loading code
+    if args.data == 'cifar10':
+        if os.path.exists('{}/cifar10'.format(data_path)):
+            traindir = os.path.join('{}/cifar10'.format(data_path))
+        else:
+            traindir = '../cifar10'
+    elif args.data == 'cifar100':
+        if os.path.exists('{}/cifar100'.format(data_path)):
+            traindir = os.path.join('{}/cifar100'.format(data_path))
+        else:
+            traindir = '../cifar100'
+    elif args.data == 'fmow':
+        traindir = train_csv
+    valdir = test_csv
 
-    normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406),
+    if args.data == 'cifar10':
+        dataset_cls = datasets.CIFAR10
+        normalize = transforms.Normalize(mean=(0.4914, 0.4822, 0.4465),
+                                        std=(0.2023, 0.1994, 0.2010))
+    elif args.data == 'cifar100':
+        dataset_cls = datasets.CIFAR100
+        normalize = transforms.Normalize(mean=(0.5071, 0.4867, 0.4408),
+                                        std=(0.2675, 0.2565, 0.2761))
+    elif args.data == 'fmow':
+        dataset_cls = CustomDatasetFromImages
+        normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406),
                                      std=(0.229, 0.224, 0.225))
 
-    if args.aug_plus:
-        # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
-        augmentation = [
-            transforms.Resize(224*2),
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply(
-                [moco.loader.GaussianBlur([.1, 2.])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-    else:
-        raise NotImplementedError("Moco v1 augmentation not adapted")
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
 
-    if temporal == False:
-        # Baseline
-        train_dataset = CustomDatasetFromImages(train_csv,
-            transform=moco.loader.TwoCropsTransform(
-                transforms.Compose(augmentation)))
-    else:
-        # Temporal
-        aug = [
-            transforms.Resize(224*2),
-            transforms.CenterCrop(224*2),
-            transforms.RandomResizedCrop(224),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply(
-                [moco.loader.GaussianBlur([.1, 2.])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-        train_dataset = CustomDatasetFromImagesTemporal(train_csv,
-            transform=transforms.Compose(aug))
+    transform_train = transforms.Compose([
+       transforms.Scale(224),
+       transforms.RandomCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    transform_test = transforms.Compose([
+       transforms.Scale(224),
+       transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+
+    train_dataset = dataset_cls(traindir, transform=transform_train)
+
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -309,7 +324,16 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(
             train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+
+    val_loader = torch.utils.data.DataLoader(
+        dataset_cls(valdir, transform=transform_test),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
+
+    if args.evaluate:
+        validate(val_loader, model, criterion, args, writer)
+        return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -319,18 +343,25 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args, writer)
 
+        # evaluate on validation set
+        acc1 = validate(val_loader, model, criterion, args, writer, epoch)
+
+        # remember best acc@1 and save checkpoint
+        is_best = acc1 > best_acc1
+        best_acc1 = max(acc1, best_acc1)
+
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            if epoch % args.ckpt_frequency == 0 or epoch == args.epochs - 1:
+            if epoch % 10 == 0 or epoch == args.epochs - 1:
                 save_checkpoint({
                     'epoch': epoch + 1,
                     'arch': args.arch,
                     'state_dict': model.state_dict(),
+                    'best_acc1': best_acc1,
                     'optimizer': optimizer.state_dict(),
-                }, is_best=False, filename=os.path.join(args.save_dir, 'checkpoint_{:04d}.pth.tar'.format(epoch)))              
-
-    if writer is not None:
-        writer.close()
+                }, is_best, filename='{}/checkpoint.pt'.format(args.save_dir))
+            if epoch == args.start_epoch:
+                sanity_check(model.state_dict(), args.pretrained)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, writer):
@@ -339,66 +370,39 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer):
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
-    top_n = AverageMeter('Acc@n', ':6.2f')
-
-    progress_items = [batch_time, data_time, losses, top1, top5]
-    progress_items += [top_n]
-
-
     progress = ProgressMeter(
         len(train_loader),
-        progress_items,
+        [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
-    # switch to train mode
-    model.train()
+    """
+    Switch to eval mode:
+    Under the protocol of linear classification on frozen features/models,
+    it is not legitimate to change any part of the pre-trained model.
+    BatchNorm in train mode may revise running mean/std (even if it receives
+    no gradient), which are part of the model parameters too.
+    """
+    model.eval()
     n_iters = len(train_loader) * epoch
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            images = images.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output, target = model(im_q=images[0], im_k=images[1])
+        output = model(images)
+        loss = criterion(output, target)
 
-        if args.loss == 'cpc':
-            loss = criterion(output, target)
-        elif args.loss == 'ml_cpc':
-            device = output.device
-            k = output.size(1)
-            if args.ml_cpc_alpha_geo:
-                alpha = (np.log(args.ml_cpc_alpha) - np.log(args.ml_cpc_alpha_low)) * (1 - float(epoch) / args.epochs) + np.log(args.ml_cpc_alpha_low)
-                alpha = np.exp(alpha)
-            else:
-                alpha = args.ml_cpc_alpha
-            beta = (k - alpha) / (k - 1)
-            logits = torch.cat([
-                output[:, :1] + torch.log(torch.tensor(alpha).float()).to(device),
-                output[:, 1:] + torch.log(torch.tensor(beta).float()).to(device)
-            ], dim=1)
-            logits = logits.view(1, -1)
-            labels = torch.zeros_like(output)
-            labels[:, 0] += 1.0 / output.size(0)
-            labels = labels.view(1, -1)
-            loss = criterion(F.log_softmax(logits, dim=1), labels)
-            loss = loss / torch.tensor(alpha).float()
-        else:
-            raise NotImplementedError(args.loss + ' not implemented.')
-
-        # acc1/acc5 are (K+1)-way contrast classifier accuracy
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images[0].size(0))
-        top1.update(acc1[0], images[0].size(0))
-        top5.update(acc5[0], images[0].size(0))
-
-        acc_n = accuracy_n(output)
-        top_n.update(acc_n.item(), images[0].size(0))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -411,23 +415,89 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer):
 
         if i % args.print_freq == 0:
             progress.display(i)
-
             if writer is not None:
-                writer.add_scalar('pretrain/acc1', top1.avg, n_iters+i)
-                writer.add_scalar('pretrain/acc5', top5.avg, n_iters+i)
-                writer.add_scalar('pretrain/batch_time',
-                                  batch_time.avg, n_iters+i)
-                writer.add_scalar('pretrain/data_time',
-                                  data_time.avg, n_iters+i)
-                writer.add_scalar('pretrain/loss', losses.avg, n_iters+i)
-                writer.add_scalar('pretrain/top_n', top_n.avg, n_iters+i)
+                writer.add_scalar('train/acc1', top1.avg, n_iters+i)
+                writer.add_scalar('train/acc5', top5.avg, n_iters+i)
+                writer.add_scalar('train/batch_time', batch_time.avg, n_iters+i)
+                writer.add_scalar('train/data_time', data_time.avg, n_iters+i)
+                writer.add_scalar('train/loss', losses.avg, n_iters+i)
 
+
+def validate(val_loader, model, criterion, args, writer, epoch=-1):
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
+
+    # switch to evaluate mode
+    model.eval()
+
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target) in enumerate(val_loader):
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
+
+            # compute output
+            output = model(images)
+            loss = criterion(output, target)
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        # TODO: this should also be done with the ProgressMeter
+        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
+        if writer is not None and epoch >= 0:
+            writer.add_scalar('val/acc1', top1.avg, epoch)
+            writer.add_scalar('val/acc5', top5.avg, epoch)
+
+    return top1.avg
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
+
+
+def sanity_check(state_dict, pretrained_weights):
+    """
+    Linear classifier should not change any weights other than the linear layer.
+    This sanity check asserts nothing wrong happens (e.g., BN stats updated).
+    """
+    print("=> loading '{}' for sanity check".format(pretrained_weights))
+    checkpoint = torch.load(pretrained_weights, map_location="cpu")
+    state_dict_pre = checkpoint['state_dict']
+
+    for k in list(state_dict.keys()):
+        # only ignore fc layer
+        if 'fc.weight' in k or 'fc.bias' in k:
+            continue
+
+        # name in pretrained model
+        k_pre = 'module.encoder_q.' + k[len('module.'):] \
+            if k.startswith('module.') else 'module.encoder_q.' + k
+
+        assert ((state_dict[k].cpu() == state_dict_pre[k_pre]).all()), \
+            '{} is changed in linear classifier training.'.format(k)
+
+    print("=> sanity check passed.")
 
 
 class AverageMeter(object):
@@ -483,20 +553,6 @@ def adjust_learning_rate(optimizer, epoch, args):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    if args.loss == 'mw_cpc':
-        weight_decay = args.weight_decay
-        if args.ml_cpc_alpha_cos:
-            alpha = (args.ml_cpc_alpha - args.ml_cpc_alpha_low) * 0.5 * (1. + math.cos(math.pi * epoch / args.epochs)) + args.ml_cpc_alpha_low
-        elif args.ml_cpc_alpha_geo:
-            alpha = (np.log(args.ml_cpc_alpha) - np.log(args.ml_cpc_alpha_low)) * (1 - float(epoch) / args.epochs) + np.log(args.ml_cpc_alpha_low)
-            alpha = np.exp(alpha)
-        else:
-            alpha = args.ml_cpc_alpha
-        print('weight decay {}'.format(weight_decay * alpha))
-        for param_group in optimizer.param_groups:
-            param_group['weight_decay'] = weight_decay * alpha
-
-
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -514,17 +570,6 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-def accuracy_n(output):
-    """
-    Computes the accuracy over the top n predictions for Nx(K+1) class, N label classification.
-    We assume that the targets are size (N, K+1) where the first element is positive.
-    """
-    with torch.no_grad():
-        top_n = output.size(0)
-        k = output.size(1)
-        _, pred = output.view(-1).topk(top_n, 0, True, True)
-        correct = pred.fmod(k).eq(0.0)
-        return correct.float().sum().mul(100.0 / top_n)
 
 if __name__ == '__main__':
     main()

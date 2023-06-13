@@ -19,28 +19,27 @@ This is a PyTorch implementation of [Geography-Aware Self-Supervised Learning](h
 Your data directory should be in the following format:
 
 ```
-${DATASET_ROOT}
-├── train
-│   ├── class_1
-│   │   ├── class_1_1
-│   │   │   ├── image_1_1_1.jpg
-│   │   │   ├── image_1_1_2.jpg
-│   │   │   ├── ...
+${Bird_root}
+├── bird_1
+│   ├── xxx.jpg  
+│   ├── xxx.jpg
+│   ├── ...
+├── bird_2
+│   ├── xxx.jpg  
+│   ├── xxx.jpg
+│   ├── ...
+├── ...
 
-├── val
-│   ├── class_1
-│   │   ├── class_1_1
-│   │   │   ├── image_1_1_1.jpg
-│   │   │   ├── image_1_1_2.jpg
-│   │   │   ├── ...
+
+
+${Satellite_root}
+├── xxx.jpg  
+├── xxx.jpg  
+├── ...
+
 ```
 
-Then, you need to create a csv file for training and validation. The csv file should have the following columns:
 
-```
-label, file_dir, lat, lon
-```
-****Note: Check out the csv files in the csvs/ folder for detailed format****
 
 
 ### Self-Supervised Training
@@ -49,13 +48,16 @@ Similar to official implementation of MoCo-v2, this implementation only supports
 
 To do self-supervised pre-training of a ResNet-50 model on fmow using our MoCo-v2+Geo+TP model in an 4-gpu machine, run:
 ```
-python moco_fmow/main_moco_geo+tp.py \ 
+python moco_fmow/main_pretrain.py \ 
     -a resnet50 \
     --lr 0.03 \
     --dist-url 'tcp://localhost:14653' --multiprocessing-distributed --moco-t 0.02 --world-size 1 --rank 0 --mlp -j 4 \
     --loss cpc --epochs 200 --batch-size 256 --moco-dim 128 --aug-plus --cos \
     --save-dir ${PT_DIR} \
-    --data_path ${Path to the data folder} \
+    --bird_path", ${Path to the bird image folder} \ 
+    --satellite_path, ${Path to the satellite image folder} \ 
+    --bird_satellite_pair_csv, ${Path to the bird satellite pair csv} \
+
 ```
 
 
