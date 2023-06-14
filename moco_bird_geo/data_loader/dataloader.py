@@ -58,9 +58,9 @@ class Bird_Satellite_Dataset(Dataset):
         return self.bird_geo_pair_csv.shape[0]
 
     def __getitem__(self, index):
-        bird_idx, satellite_idx, geo_label = self.bird_geo_pair_csv.iloc[index]
-        bird_img = Image.open(self.bird_image_fetcher.fetch_image_file(bird_idx))
-        satellite_img = Image.open(list(self.satellite_path.iterdir())[(satellite_idx)])
+        _, idx, geo_label = self.bird_geo_pair_csv.iloc[index]
+        bird_img = Image.open(self.bird_image_fetcher.fetch_image_file(idx))
+        satellite_img = Image.open(list(self.satellite_path.iterdir())[(idx)])
         
         if self.transform is not None:
             bird_tensor = self.transform(bird_img)
